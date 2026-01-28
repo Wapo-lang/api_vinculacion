@@ -82,7 +82,6 @@ class Libro(models.Model):
         BASE_API = "http://127.0.0.1:8000/api/"
         url_libros = f"{BASE_API}libros-api/"
         
-        # Sincronización por ISBN para evitar conflictos de ID
         identificador = self.isbn if self.isbn else self.id
         url_especifica = f"{url_libros}{identificador}/" 
 
@@ -91,20 +90,29 @@ class Libro(models.Model):
                 requests.delete(url_especifica, timeout=5)
                 return 
 
-            # Sincronizar Autor primero
+            # --- LÓGICA DE AUTOR SIN DUPLICADOS ---
             django_author_id = None
             if self.author:
-                auth_payload = {'nombre': self.author.firstname, 'apellido': self.author.lastname or '.'}
-                auth_res = requests.post(f"{BASE_API}autores-api/", json=auth_payload, timeout=5)
+                nom_odoo = self.author.firstname.strip()
+                ape_odoo = self.author.lastname.strip() if self.author.lastname else '.'
                 
-                if auth_res.status_code in [200, 201]:
-                    django_author_id = auth_res.json().get('id')
-                else:
-                    search_res = requests.get(f"{BASE_API}autores-api/", timeout=5)
-                    if search_res.status_code == 200:
-                        match = next((a for a in search_res.json() if a['nombre'] == self.author.firstname), None)
-                        django_author_id = match.get('id') if match else None
+                # 1. BUSCAR primero en Django para ver si ya existe
+                search_res = requests.get(f"{BASE_API}autores-api/", timeout=5)
+                if search_res.status_code == 200:
+                    autores_lista = search_res.json()
+                    # Buscamos coincidencia exacta de nombre Y apellido
+                    match = next((a for a in autores_lista if a['nombre'] == nom_odoo and a['apellido'] == ape_odoo), None)
+                    if match:
+                        django_author_id = match.get('id')
 
+                # 2. SOLO SI NO EXISTE, lo creamos
+                if not django_author_id:
+                    auth_payload = {'nombre': nom_odoo, 'apellido': ape_odoo}
+                    auth_res = requests.post(f"{BASE_API}autores-api/", json=auth_payload, timeout=5)
+                    if auth_res.status_code in [200, 201]:
+                        django_author_id = auth_res.json().get('id')
+
+            # --- SINCRONIZACIÓN DEL LIBRO ---
             libro_payload = {
                 'titulo': self.firstname,
                 'isbn': str(self.isbn).strip() if self.isbn else '',
