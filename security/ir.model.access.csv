@@ -1,0 +1,7 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_biblioteca_libro,biblioteca.libro,model_biblioteca_libro,base.group_user,1,1,1,1
+access_biblioteca_autor,biblioteca.autor,model_biblioteca_autor,base.group_user,1,1,1,1
+access_biblioteca_prestamo,biblioteca.prestamo,model_biblioteca_prestamo,base.group_user,1,1,1,1
+access_biblioteca_multa,biblioteca.multa,model_biblioteca_multa,base.group_user,1,1,1,1
+access_biblioteca_cedula,biblioteca.cedula,model_biblioteca_cedula,base.group_user,1,1,1,1
+access_biblioteca_usuario,biblioteca.usuario,model_biblioteca_usuario,base.group_user,1,1,1,1
