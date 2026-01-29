@@ -1,3 +1,4 @@
+from asyncio import exceptions
 from odoo import models, fields, api
 from datetime import datetime, timedelta
 from odoo.exceptions import ValidationError
@@ -8,259 +9,209 @@ import logging
 
 _logger = logging.getLogger(__name__)
 
-from odoo import models, fields, api
-import requests
-import logging
-
-_logger = logging.getLogger(__name__)
-
-from odoo import models, fields, api
-import requests
-import logging
-
-_logger = logging.getLogger(__name__)
-
+TOKEN = "d7b58bfda5a69833a8263e5a6f2c2746814f4033"
+BASE_API = "http://127.0.0.1:8000/api/"
+HEADERS = {
+    'Authorization': f'Token {TOKEN}',
+    'Content-Type': 'application/json'
+}
 class Libro(models.Model):
     _name = 'biblioteca.libro'
     _description = 'Gestión de Libros'
     _rec_name = 'firstname'
     
-    # --- CAMPOS ---
     firstname = fields.Char(string='Nombre Libro', required=True)
     author = fields.Many2one('biblioteca.autor', string='Autor Libro')
     isbn = fields.Char(string='ISBN')
-    value = fields.Integer(string='Número de Ejemplares', default=1)
-    value2 = fields.Float(compute="_value_pc", store=True, string='Valor Computado')
     description = fields.Text(string='Descripción')
-    openlibrary_description = fields.Text(string='Estado de Sincronización')
+    openlibrary_description = fields.Text(string='Estado de Sincronización', readonly=True)
+    value = fields.Integer(string='Número de Ejemplares', default=1)
     ejemplares_disponibles = fields.Integer(string='Ejemplares Disponibles', default=1)
 
-    # --- 1. MÉTODOS DE CÁLCULO (Solución al AttributeError) ---
+    # --- MÉTODO PARA SINCRONIZAR A DJANGO ---
+    def _sync_to_django(self):
+        url_libros = f"{BASE_API}libros-api/"
+        django_author_id = self._get_or_create_django_author()
+        
+        payload = {
+            'titulo': self.firstname,
+            'isbn': self.isbn,
+            'descripcion': self.description or '',
+            'cantidad_total': self.value,
+            'ejemplares_disponibles': self.ejemplares_disponibles,
+            'autor': django_author_id
+        }
+
+        try:
+            response = requests.post(url_libros, json=payload, headers=HEADERS, timeout=10)
+            
+            # Si el ISBN ya existe, actualizamos usando el ISBN como identificador
+            if response.status_code == 400:
+                url_put = f"{url_libros}{self.isbn}/"
+                response = requests.put(url_put, json=payload, headers=HEADERS, timeout=10)
+            
+            if response.status_code in [200, 201, 204]:
+                self.with_context(skip_sync=True).write({
+                    'openlibrary_description': 'Sincronizado con Django correctamente ✅'
+                })
+        except Exception as e:
+            _logger.error(f"Error sincronizando libro con Django: {e}")
+
+    def _get_or_create_django_author(self):
+        """ Busca el autor en Django por nombre/apellido o lo crea si no existe """
+        if not self.author: 
+            return None
+
+        url_autores = f"{BASE_API}autores-api/"
+        nom = self.author.firstname.strip()
+        ape = (self.author.lastname or '').strip() or '.'
+        
+        try:
+            res = requests.get(url_autores, headers=HEADERS, timeout=10)
+            if res.status_code == 200:
+                autores = res.json()
+                match = next((a for a in autores if 
+                            a['nombre'].lower() == nom.lower() and 
+                            a['apellido'].lower() == ape.lower()), None)
+                if match:
+                    return match['id']
+            
+            # Crear si no existe
+            payload = {'nombre': nom, 'apellido': ape}
+            new_auth_res = requests.post(url_autores, json=payload, headers=HEADERS, timeout=10)
+            return new_auth_res.json().get('id') if new_auth_res.status_code in [200, 201] else None
+
+        except Exception as e:
+            _logger.error(f"Error en traductor de autor: {e}")
+            return None
+
+    @api.onchange('isbn')
+    def _onchange_isbn_logic(self):
+        if not self.isbn or len(self.isbn) < 10: return
+        search_isbn = self.isbn.strip()
+        
+        # 1. BUSCAR EN DJANGO PRIMERO
+        try:
+            res = requests.get(f"{BASE_API}libros-api/{search_isbn}/", headers=HEADERS, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                self.firstname = data.get('titulo')
+                self.description = data.get('descripcion')
+                self.openlibrary_description = "Cargado desde Django (Ya existía)."
+                return
+        except: pass
+
+        # 2. BUSCAR EN OPEN LIBRARY
+        ol_url = f"https://openlibrary.org/api/books?bibkeys=ISBN:{search_isbn}&format=json&jscmd=data"
+        try:
+            response = requests.get(ol_url, timeout=10)
+            data = response.json()
+            key = f"ISBN:{search_isbn}"
+            
+            if key in data:
+                info = data[key]
+                self.firstname = info.get('title')
+                self.description = str(info.get('notes', info.get('description', '')))
+                self.openlibrary_description = "Obtenido de Open Library."
+                
+                if info.get('authors'):
+                    full_name = info['authors'][0].get('name')
+                    parts = full_name.split(' ', 1)
+                    self._get_or_create_local_author(parts[0], parts[1] if len(parts) > 1 else '.')
+        except:
+            self.openlibrary_description = "Error al conectar con fuentes externas."
+
+    def _get_or_create_local_author(self, nom, ape):
+        autor_obj = self.env['biblioteca.autor'].search([('firstname','=',nom),('lastname','=',ape)], limit=1)
+        if not autor_obj:
+            autor_obj = self.env['biblioteca.autor'].create({'firstname': nom, 'lastname': ape})
+        self.author = autor_obj.id
     
-    @api.depends('value')
-    def _value_pc(self):
-        """Calcula el valor dividido por 100 para el campo value2."""
+    def action_prestar(self):
         for record in self:
-            if record.value:
-                record.value2 = float(record.value) / 100
+            if record.ejemplares_disponibles > 0:
+                record.ejemplares_disponibles -= 1
             else:
-                record.value2 = 0.0
+                raise exceptions.UserError("No hay ejemplares disponibles.")
 
-    @api.onchange('value')
-    def _onchange_value(self):
-        """Actualiza ejemplares disponibles al cambiar el total localmente."""
-        self.ejemplares_disponibles = self.value
-
-    # --- 2. MÉTODOS DE CICLO DE VIDA (CRUD) ---
+    def action_devolver(self):
+        for record in self:
+            if record.ejemplares_disponibles < record.value:
+                record.ejemplares_disponibles += 1
+            else:
+                raise exceptions.UserError("Stock lleno.")
 
     @api.model_create_multi
     def create(self, vals_list):
-        for vals in vals_list:
-            if 'value' in vals and 'ejemplares_disponibles' not in vals:
-                vals['ejemplares_disponibles'] = vals['value']
-        
-        records = super(Libro, self).create(vals_list)
+        records = super().create(vals_list)
         for record in records:
-            record._sync_to_django(method='POST')
+            record._sync_to_django()
         return records
-
+    
     def write(self, vals):
         res = super(Libro, self).write(vals)
-        for record in self:
-            record._sync_to_django(method='PUT')
+        if not self.env.context.get('skip_sync'):
+            for record in self:
+                record._sync_to_django()
         return res
 
     def unlink(self):
-        for record in self:
-            _logger.info(f"Eliminando libro {record.firstname} en Django...")
-            record._sync_to_django(method='DELETE')
+        _logger.info("Eliminado en Odoo. Permanece en Django.")
         return super(Libro, self).unlink()
-
-    # --- 3. MOTOR DE SINCRONIZACIÓN API ---
-
-    def _sync_to_django(self, method='POST'):
-        BASE_API = "http://127.0.0.1:8000/api/"
-        url_libros = f"{BASE_API}libros-api/"
-        
-        identificador = self.isbn if self.isbn else self.id
-        url_especifica = f"{url_libros}{identificador}/" 
-
-        try:
-            if method == 'DELETE':
-                requests.delete(url_especifica, timeout=5)
-                return 
-
-            # --- LÓGICA DE AUTOR SIN DUPLICADOS ---
-            django_author_id = None
-            if self.author:
-                nom_odoo = self.author.firstname.strip()
-                ape_odoo = self.author.lastname.strip() if self.author.lastname else '.'
-                
-                # 1. BUSCAR primero en Django para ver si ya existe
-                search_res = requests.get(f"{BASE_API}autores-api/", timeout=5)
-                if search_res.status_code == 200:
-                    autores_lista = search_res.json()
-                    # Buscamos coincidencia exacta de nombre Y apellido
-                    match = next((a for a in autores_lista if a['nombre'] == nom_odoo and a['apellido'] == ape_odoo), None)
-                    if match:
-                        django_author_id = match.get('id')
-
-                # 2. SOLO SI NO EXISTE, lo creamos
-                if not django_author_id:
-                    auth_payload = {'nombre': nom_odoo, 'apellido': ape_odoo}
-                    auth_res = requests.post(f"{BASE_API}autores-api/", json=auth_payload, timeout=5)
-                    if auth_res.status_code in [200, 201]:
-                        django_author_id = auth_res.json().get('id')
-
-            # --- SINCRONIZACIÓN DEL LIBRO ---
-            libro_payload = {
-                'titulo': self.firstname,
-                'isbn': str(self.isbn).strip() if self.isbn else '',
-                'descripcion': self.description or '',
-                'cantidad_total': self.value,
-                'ejemplares_disponibles': self.ejemplares_disponibles,
-                'autor': django_author_id
-            }
-
-            if method == 'POST':
-                response = requests.post(url_libros, json=libro_payload, timeout=10)
-                if response.status_code == 400 and "isbn" in response.text:
-                    return self._sync_to_django(method='PUT')
-            
-            elif method == 'PUT':
-                response = requests.put(url_especifica, json=libro_payload, timeout=10)
-                if response.status_code == 404:
-                    return self._sync_to_django(method='POST')
-
-            if response.status_code in [200, 201, 204]:
-                self.openlibrary_description = f"Sincronización exitosa ({method})."
-            else:
-                self.openlibrary_description = f"Nota Django: {response.text}"
-
-        except Exception as e:
-            _logger.error(f"Error en API {method}: {str(e)}")
-
-    # --- 4. BÚSQUEDA POR ISBN (GET) ---
-
-    @api.onchange('isbn')
-    def _onchange_isbn_fetch_data(self):
-        if not self.isbn or len(self.isbn) < 5:
-            return
-
-        search_isbn = str(self.isbn).strip()
-        success_django = False
-        
-        # 1. INTENTO EN DJANGO
-        try:
-            django_url = f"http://127.0.0.1:8000/api/libros-api/?isbn={search_isbn}"
-            res = requests.get(django_url, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                if isinstance(data, list) and len(data) > 0:
-                    book = data[0]
-                    self.firstname = book.get('titulo')
-                    self.description = book.get('descripcion')
-                    
-                    # Autor desde Django
-                    autor_info = book.get('autor_detalle')
-                    if autor_info:
-                        self._get_or_create_author(
-                            autor_info.get('nombre'), 
-                            autor_info.get('apellido')
-                        )
-                    
-                    self.openlibrary_description = "Datos cargados desde Django."
-                    success_django = True
-        except Exception as e:
-            _logger.warning(f"Django no disponible: {e}")
-
-        # 2. INTENTO EN OPEN LIBRARY (Si Django falló o no encontró nada)
-        if not success_django:
-            ol_url = f"https://openlibrary.org/api/books?bibkeys=ISBN:{search_isbn}&format=json&jscmd=data"
-            try:
-                response = requests.get(ol_url, timeout=10)
-                if response.status_code == 200:
-                    res_json = response.json()
-                    key = f"ISBN:{search_isbn}"
-                    
-                    if key in res_json:
-                        info = res_json[key]
-                        
-                        # --- TÍTULO ---
-                        self.firstname = info.get('title', 'Sin título')
-
-                        # --- AUTOR (Validación Robusta) ---
-                        if info.get('authors'):
-                            full_name = info['authors'][0].get('name', '')
-                            if full_name:
-                                parts = full_name.split(' ', 1)
-                                nom = parts[0]
-                                ape = parts[1] if len(parts) > 1 else '.'
-                                self._get_or_create_author(nom, ape)
-
-                        # --- DESCRIPCIÓN (Validación Robusta) ---
-                        # OpenLibrary a veces manda un string, otras un dict {'value': '...'}
-                        raw_desc = info.get('description', info.get('notes', 'Sin descripción.'))
-                        if isinstance(raw_desc, dict):
-                            self.description = raw_desc.get('value', '')
-                        else:
-                            self.description = str(raw_desc)
-                            
-                        self.openlibrary_description = "Datos cargados desde Open Library."
-                    else:
-                        self.openlibrary_description = "ISBN no encontrado en ninguna fuente."
-                else:
-                    self.openlibrary_description = f"Error en Open Library (Status {response.status_code})"
-            
-            except Exception as e:
-                _logger.error(f"Error procesando Open Library: {e}")
-                self.openlibrary_description = f"Error al procesar datos externos: {str(e)}"
-    
-    def _get_or_create_author(self, nombre, apellido):
-        """
-        Busca un autor por nombre y apellido. 
-        Si no existe, lo crea. Luego lo asigna al libro.
-        """
-        if not nombre:
-            return
-        
-        # Referencia al modelo de autor
-        autor_model = self.env['biblioteca.autor']
-        
-        # Limpieza de datos
-        nombre = nombre.strip()
-        apellido = apellido.strip() if apellido else '.'
-        
-        # Buscar si ya existe
-        # Nota: Usamos 'firstname' y 'lastname' porque así se llaman en tu modelo Autor
-        autor_existente = autor_model.search([
-            ('firstname', '=', nombre),
-            ('lastname', '=', apellido)
-        ], limit=1)
-        
-        if autor_existente:
-            self.author = autor_existente.id
-        else:
-            # Si no existe, lo creamos
-            nuevo_autor = autor_model.create({
-                'firstname': nombre,
-                'lastname': apellido
-            })
-            self.author = nuevo_autor.id
 
 class Autor(models.Model):
     _name = 'biblioteca.autor'
     _description = 'Gestión de Autores'
-    _rec_name_ = 'firstname'
+    _rec_name = 'display_name'
 
     firstname = fields.Char(string='Nombre', required=True)
     lastname = fields.Char(string='Apellido', required=True)
+    biografia = fields.Text(string='Biografía') 
     display_name = fields.Char(string='Nombre Completo', compute='_compute_display', store=True)
 
     @api.depends('firstname', 'lastname')
     def _compute_display(self):
         for record in self:
             record.display_name = f"{record.firstname} {record.lastname}"
+
+    def _sync_author_to_django(self):
+        url_autores = f"{BASE_API}autores-api/"
+        payload = {
+            'nombre': self.firstname,
+            'apellido': self.lastname,
+            'bibliografia': self.biografia or ''
+        }
+
+        try:
+            res = requests.get(url_autores, headers=HEADERS, timeout=5)
+            if res.status_code == 200:
+                autores_django = res.json()
+                match = next((a for a in autores_django if a['nombre'].lower() == self.firstname.lower() 
+                            and a['apellido'].lower() == self.lastname.lower()), None)
+
+                if match:
+                    requests.put(f"{url_autores}{match['id']}/", json=payload, headers=HEADERS, timeout=10)
+                else:
+                    requests.post(url_autores, json=payload, headers=HEADERS, timeout=10)
+        except Exception as e:
+            _logger.error(f"Error sincronizando autor: {e}")
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        records = super(Autor, self).create(vals_list)
+        for record in records:
+            record._sync_author_to_django()
+        return records
+
+    def write(self, vals):
+        res = super(Autor, self).write(vals)
+        if not self.env.context.get('skip_sync'):
+            for record in self:
+                record._sync_author_to_django()
+        return res
+
+    def unlink(self):
+        return super(Autor, self).unlink()
    
           
 class BibliotecaMulta(models.Model):

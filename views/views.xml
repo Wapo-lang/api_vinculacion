@@ -11,7 +11,6 @@
           <field name="author"/>
           <field name="isbn"/>
           <field name="value"/>
-          <field name="value2"/>
           <field name="openlibrary_description"/>
           <field name="ejemplares_disponibles"/>
         </list>
@@ -29,7 +28,6 @@
             <field name="author"/>
             <field name="isbn"/>
             <field name="value"/>
-            <field name="value2"/>
             <field name="description"/>
             <field name="openlibrary_description"/>
             <field name="ejemplares_disponibles"/>
